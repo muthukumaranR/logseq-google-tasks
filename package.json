@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@logseq/libs": "^0.0.17",
-    "date-fns": "^3.6.0"
+    "date-fns": "^3.6.0",
+    "google-auth-library": "^9.7.0"
   },
   "devDependencies": {
     "@types/gapi": "^0.0.47",
@@ -20,6 +21,7 @@
     "@types/node": "^20.12.7",
     "typescript": "^5.4.5",
     "vite": "^5.2.10",
-    "vite-plugin-logseq": "^1.1.2"
+    "vite-plugin-logseq": "^1.1.2",
+    "vite-plugin-static-copy": "^1.0.1"
   }
 }

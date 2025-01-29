@@ -1,5 +1,6 @@
 import "@logseq/libs";
 import { IBatchBlock, PageEntity, IHookEvent, BlockEntity } from "@logseq/libs/dist/LSPlugin";
+import { OAuth2Handler, OAuthCredentials } from "./auth/oauth";
 
 import { format } from "date-fns";
 
@@ -7,6 +8,22 @@ import settingSchema from "./settings";
 
 interface HttpError extends Error {
   status?: number;
+}
+
+let oauthHandler: OAuth2Handler;
+
+async function initializeOAuth(): Promise<void> {
+  const credentials: OAuthCredentials = {
+    clientId: process.env.GOOGLE_CLIENT_ID ?? "",
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET ?? "",
+    redirectUri: `${window.location.origin}/oauth-callback.html`
+  };
+
+  if (!credentials.clientId || !credentials.clientSecret) {
+    throw new Error("Google OAuth credentials not configured");
+  }
+
+  oauthHandler = new OAuth2Handler(credentials);
 }
 
 function main() {
@@ -38,81 +55,104 @@ declare var gapi: any;
 async function syncGoogleTasks() {
   console.info("Start Syncing Google Tasks");
 
-  console.debug(gapi);
+  try {
+    // Get a valid token (will refresh if needed)
+    const accessToken = await oauthHandler.ensureValidToken();
 
-  await new Promise(resolve => {
-    gapi.load('client', resolve);
-  });
+    await new Promise(resolve => {
+      gapi.load("client", resolve);
+    });
 
-  console.debug(gapi.client);
+    let token = { access_token: accessToken };
+    gapi.client.setToken(token);
 
-  if (!logseq.settings?.access_token) {
-    throw new Error("Access token is not set.");
-  }
+    await new Promise(resolve => {
+      gapi.client.init({
+        discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/tasks/v1/rest"],
+      }).then(resolve);
+    });
 
-  let token = JSON.parse('{"access_token":"' + logseq.settings.access_token + '"}');
-  gapi.client.setToken(token);
+    let taskLists = await fetchTaskLists() ?? [];
 
-  await new Promise(resolve => {
-    gapi.client.init({
-      discoveryDocs: ['https://www.googleapis.com/discovery/v1/apis/tasks/v1/rest'],
-    }).then(resolve);
-  });
+    let tasksArray = (await Promise.all(taskLists.map(
+      async (taskList: any) => {
+        let tasks = await fetchTasks(taskList.id) ?? [];
 
-  let taskLists = await fetchTaskLists() ?? [];
+        return tasks.map((task: any) => {
+          return [taskList, task];
+        });
+      }
+    ))).flat();
 
-  let tasksArray = (await Promise.all(taskLists.map(
-    async (taskList: any) => {
-      let tasks = await fetchTasks(taskList.id) ?? [];
+    let tasksNew: { [key: string]: any[] } = {}
 
-      return tasks.map((task: any) => {
-        return [taskList, task];
-      });
-    }
-  ))).flat();
+    for (let taskArray of tasksArray) {
+      let [list, task] = taskArray as [any, any];
 
-  let tasksNew: { [key: string]: any[] } = {}
+      let res = await logseq.DB.q(`(property :google-task-id "${task.id}")`);
 
-  for (let taskArray of tasksArray) {
-    let [list, task] = taskArray as [any, any];
-
-    let res = await logseq.DB.q(`(property :google-task-id "${task.id}")`);
-
-    if (res && res.length > 1) {
-      console.warn(`Multiple tasks with the same id found: ${task.id}`);
-    }
-
-    if (res && res.length > 0) {
-      if (res[0].properties["googleTaskUpdated"] === task.updated) {
-        // Here we only try to update GTasks if updated time is the same
-        // If GTasks is newer, and there is also local changes, local changes
-        // will be discarded as Logseq currently doesn't recored change date
-        // on block level reliably.
-        pushLocalChanges(res[0], task);
-        continue;
+      if (res && res.length > 1) {
+        console.warn(`Multiple tasks with the same id found: ${task.id}`);
       }
 
-      updateTaskBlock(res[0], list, task);
+      if (res && res.length > 0) {
+        if (res[0].properties["googleTaskUpdated"] === task.updated) {
+          // Here we only try to update GTasks if updated time is the same
+          // If GTasks is newer, and there is also local changes, local changes
+          // will be discarded as Logseq currently doesn't recored change date
+          // on block level reliably.
+          pushLocalChanges(res[0], task);
+          continue;
+        }
+
+        updateTaskBlock(res[0], list, task);
+      }
+      else {
+        console.info(`Insert block for task: ${task.id}`);
+
+        let parentName = await generateParentName(list, task);
+
+        tasksNew[parentName] = tasksNew[parentName] || [];
+        tasksNew[parentName].push([list, task])
+      }
     }
-    else {
-      console.info(`Insert block for task: ${task.id}`);
 
-      let parentName = await generateParentName(list, task);
+    for (let [parentName, tasks] of Object.entries(tasksNew)) {
+      let pageEntity = await ensurePage(parentName, false);
+      if (!pageEntity) {
+        throw new Error(`Unable to create parent page ${parentName}`);
+      }
 
-      tasksNew[parentName] = tasksNew[parentName] || [];
-      tasksNew[parentName].push([list, task])
+      logseq.Editor.insertBatchBlock(pageEntity.uuid, await Promise.all(tasks.map(async ([list, task]) => {
+        return await blockContentGenerate(list, task);
+      })));
     }
-  }
-
-  for (let [parentName, tasks] of Object.entries(tasksNew)) {
-    let pageEntity = await ensurePage(parentName, false);
-    if (!pageEntity) {
-      throw new Error(`Unable to create parent page ${parentName}`);
+  } catch (error: any) {
+    if (error.message === "No token data available") {
+      logseq.UI.showMsg(
+        "Please authenticate with Google Tasks first",
+        "warning"
+      );
+      await oauthHandler.initiateAuth();
+      return;
     }
 
-    logseq.Editor.insertBatchBlock(pageEntity.uuid, await Promise.all(tasks.map(async ([list, task]) => {
-      return await blockContentGenerate(list, task);
-    })));
+    if (error.status === 401) {
+      console.error("plugin-google-tasks: Access token expired, attempting refresh");
+      try {
+        await oauthHandler.refreshAccessToken();
+        // Retry the sync
+        await syncGoogleTasks();
+        return;
+      } catch (refreshError) {
+        console.error("Failed to refresh token:", refreshError);
+        logseq.UI.showMsg("Failed to refresh authentication. Please re-authenticate.", "error");
+        await oauthHandler.logout();
+        await oauthHandler.initiateAuth();
+      }
+    }
+
+    throw error;
   }
 }
 
